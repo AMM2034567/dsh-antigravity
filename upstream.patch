@@ -1,5 +1,5 @@
 diff --git a/lib/index.js b/lib/index.js
-index 3a03058..fa2d763 100644
+index 3a03058..eaa3b4b 100644
 --- a/lib/index.js
 +++ b/lib/index.js
 @@ -12,7 +12,7 @@ import { dirname } from "node:path";
@@ -50,7 +50,7 @@ index 3a03058..fa2d763 100644
 +  for (let depth = 0; current !== undefined && current !== null && depth < 5; depth += 1) {
 +    const message = current instanceof Error ? current.message : String(current);
 +    const code = typeof current.code === "string" ? current.code : "";
-+    const text = code && !message.includes(code) ? `${message} [${code}]` : message;
++    const text = (code && !message.includes(code) ? `${message} [${code}]` : message).trim();
 +    if (text && !seen.has(text)) {
 +      seen.add(text);
 +      parts.push(text);
@@ -105,7 +105,13 @@ index 3a03058..fa2d763 100644
      return `Bad request from Antigravity. Backend said: ${message}`;
    }
    if (status === 401) return "Antigravity authentication failed. Next: run /antigravity-login, then retry.";
-@@ -1829,8 +1862,19 @@ function friendlyAntigravityError(status, text) {
+@@ -1826,11 +1859,25 @@ function friendlyAntigravityError(status, text) {
+     ? "This model has no capacity right now. Next: retry later or switch models."
+     : "Antigravity is temporarily unavailable. Next: retry or switch models.";
+   if (status === 504) return "Antigravity timed out upstream. Next: retry.";
++  if (status === undefined) {
++    return `Antigravity was unreachable over the network (${message}). Next: check your connection, proxy/TUN rules and DNS for *.googleapis.com, then retry.`;
++  }
    return message || "Antigravity request failed";
  }
  
@@ -126,7 +132,7 @@ index 3a03058..fa2d763 100644
  }
  
  function finishReasonOf(rawReason, hasToolCall, hasContent, errorMessage) {
-@@ -1937,7 +1981,7 @@ function processStreamLine(line, state) {
+@@ -1937,7 +1984,7 @@ function processStreamLine(line, state) {
        const args = isRecord(part.functionCall.args) ? part.functionCall.args : {};
        const argsText = JSON.stringify(args);
        const index = state.blocks.length;
@@ -135,7 +141,7 @@ index 3a03058..fa2d763 100644
        state.blocks.push(block);
        state.replayBlocks.push({
          type: "tool-call",
-@@ -1949,7 +1993,7 @@ function processStreamLine(line, state) {
+@@ -1949,7 +1996,7 @@ function processStreamLine(line, state) {
        out.push({
          type: "tool-call-delta",
          index,
@@ -144,7 +150,22 @@ index 3a03058..fa2d763 100644
          ...(toolName ? { name: toolName } : {}),
          argumentsDelta: argsText,
        });
-@@ -2615,6 +2659,7 @@ async function* requestAntigravityChunks(options, model, signal, store) {
+@@ -2594,7 +2641,13 @@ async function fetchStreamResponse(endpoint, headers, body, signal) {
+   } catch (error) {
+     setLastError(error);
+     if (signal?.aborted) throw new LlmError("antigravity request aborted by caller", "ABORTED", { cause: error });
+-    throw error;
++    // Surface the real transport reason instead of a bare "fetch failed":
++    // Undici hides it behind error.cause (ETIMEDOUT, ECONNRESET, UND_ERR_*).
++    throw new LlmError(
++      `antigravity request to ${endpoint} failed before any response: ${safeError(error)}`,
++      "TRANSPORT",
++      { cause: error },
++    );
+   }
+ }
+ 
+@@ -2615,6 +2668,7 @@ async function* requestAntigravityChunks(options, model, signal, store) {
    let response;
    let lastText = "";
    let runtimeModel = runtimeCandidates[0];
@@ -152,7 +173,7 @@ index 3a03058..fa2d763 100644
  
    for (let emptyAttempt = 0; emptyAttempt <= 2; emptyAttempt++) {
      if (signal?.aborted) throw new LlmError("antigravity request aborted by caller", "ABORTED");
-@@ -2628,12 +2673,18 @@ async function* requestAntigravityChunks(options, model, signal, store) {
+@@ -2628,12 +2682,28 @@ async function* requestAntigravityChunks(options, model, signal, store) {
        setLastResolvedRuntimeModel(runtimeModel);
        const body = JSON.stringify(buildRequest(options, model, projectId, runtimeModel, effort));
  
@@ -160,7 +181,18 @@ index 3a03058..fa2d763 100644
 +      diagnostics.attempts = attempts;
        for (const endpoint of endpointCandidates()) {
          setLastEndpoint(endpoint);
-         response = await fetchStreamResponse(endpoint, requestHeaders, body, signal);
+-        response = await fetchStreamResponse(endpoint, requestHeaders, body, signal);
++        try {
++          response = await fetchStreamResponse(endpoint, requestHeaders, body, signal);
++        } catch (error) {
++          // Aborts must propagate; transport failures should fall through to the next
++          // candidate instead of giving up on the first unreachable host.
++          if (signal?.aborted || error?.code === "ABORTED") throw error;
++          response = undefined;
++          lastText = safeError(error);
++          recordLastAttempt(attempts, endpoint, undefined, "TRANSPORT");
++          continue;
++        }
          setLastStatus(response.status);
 -        if (response.ok) break;
 +        if (response.ok) {
@@ -172,7 +204,7 @@ index 3a03058..fa2d763 100644
          if (response.status === 429 && /Individual quota reached/i.test(lastText)) break;
          if (![403, 404, 429, 500, 502, 503, 504].includes(response.status)) break;
        }
-@@ -2646,7 +2697,7 @@ async function* requestAntigravityChunks(options, model, signal, store) {
+@@ -2646,7 +2716,7 @@ async function* requestAntigravityChunks(options, model, signal, store) {
      if (!response || !response.ok) {
        const friendly = friendlyAntigravityError(response?.status, lastText);
        throw new LlmError(
@@ -181,7 +213,7 @@ index 3a03058..fa2d763 100644
          classifyAntigravityError(friendly),
        );
      }
-@@ -2755,6 +2806,7 @@ function doctorText() {
+@@ -2755,6 +2825,7 @@ function doctorText() {
      `matchedModel=${current.matchedModelDebug || "none"}`,
      `lastEndpoint=${current.endpoint || "none"}`,
      `lastStatus=${current.status ?? "none"}`,
