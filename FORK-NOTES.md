@@ -194,17 +194,31 @@ node fetch + HTTPS_PROXY + NODE_USE_ENV_PROXY=1     → 200  ✅
 > 打开系统「使用代理服务器」开关**没有用**，配 PAC 也**没有用**。
 > 只有 TUN / 全局模式（网络层透明拦截）才能绕过这个限制。
 
-所以本仓库提供 `start-web.ps1`：
+所以本仓库提供 `start-web.ps1`。它**不写死代理端口**，而是用 node 实测后决策：
+
+1. 先测「直连」能不能到 Google。能通说明 TUN / 全局模式已经生效
+   （Cloudflare WARP 默认就是 TUN），那就**一个代理变量都不设**。
+2. 不通则枚举本机代理进程（xray / v2rayN / FlClash / Clash / WARP / sing-box ...）
+   占用的监听端口，逐个实测，用第一个真能通的。
+   SOCKS5 端口会被自动跳过 —— undici 不支持 SOCKS，只有 HTTP 代理有用。
+3. 都没通则打印诊断（含 `warp-cli status`）后退出，不会启动一个注定失败的服务器。
 
 ```powershell
-.\start-web.ps1 -OpenBrowser
-.\start-web.ps1 -Proxy http://127.0.0.1:7890      # 换代理端口
-.\start-web.ps1 -Profile tui -Port 3081
+.\start-web.ps1                            # 自动检测；启动后打开浏览器
+.\start-web.ps1 -DetectOnly                # 只检测，不启动
+.\start-web.ps1 -Proxy http://127.0.0.1:7890
+.\start-web.ps1 -Port 3081 -NoBrowser
+.\start-web.ps1 -Profile tui
+.\start-web.ps1 -WorkingDirectory D:\proj
 ```
 
-它设置：`HTTP_PROXY` / `HTTPS_PROXY` / `NODE_USE_ENV_PROXY=1` /
+确认可用之后它才设置 `HTTP_PROXY` / `HTTPS_PROXY` / `NODE_USE_ENV_PROXY=1` /
 `NO_PROXY=localhost,127.0.0.1,registry.npmmirror.com,cdn.npmmirror.com`
-（最后一项是把国内镜像排除掉，否则 pnpm 会被绕进代理，变慢甚至失败）。
+（最后一项把国内镜像排除，否则 pnpm 会被绕进代理，变慢甚至失败）。
+这些都是**子进程级**的，不会改动系统或用户级环境变量。
+
+> Windows 桌面上还有一份带 `.cmd` 双击启动器的同款脚本；`.cmd` 会优先调用 `pwsh`
+> 而不是 `powershell` —— PowerShell 5.1 不按 UTF-8 读 `.ps1`，中文会变乱码。
 
 如果不想用脚本，也可以把 `NODE_USE_ENV_PROXY=1` 和 `HTTPS_PROXY` 设成用户级环境变量，
 但那会影响**所有** Node 程序（对你其他 AI CLI 多半是好事，但属于全局改动）。
