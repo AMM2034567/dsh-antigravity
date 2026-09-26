@@ -1,0 +1,191 @@
+diff --git a/lib/index.js b/lib/index.js
+index 3a03058..fa2d763 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -12,7 +12,7 @@ import { dirname } from "node:path";
+ import { spawn } from "node:child_process";
+ import {
+   CONTEXT_WINDOW_EXCEEDED_CODE,
+-  CallId,
++  ToolCallId,
+   EMPTY_RESPONSE_CODE,
+   LlmAdapter,
+   LlmError,
+@@ -39,10 +39,13 @@ const MODEL_CACHE_TTL_MS = 30 * 60 * 1000;
+ const OAUTH_CALLBACK_TIMEOUT_MS = 5 * 60 * 1000;
+ 
+ const DEFAULT_ENDPOINT = "https://cloudcode-pa.googleapis.com";
+-const ENDPOINT_FALLBACKS = [
+-  DEFAULT_ENDPOINT,
+-  "https://daily-cloudcode-pa.sandbox.googleapis.com",
+-];
++// The official Antigravity client (`language_server --cloud_code_endpoint`) targets the
++// daily host. The sandbox host is a last resort only: it rejects many regions with
++// HTTP 400 "User location is not supported for the API use".
++const DAILY_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com";
++const SANDBOX_ENDPOINT = "https://daily-cloudcode-pa.sandbox.googleapis.com";
++const ENDPOINT_FALLBACKS = [DEFAULT_ENDPOINT, DAILY_ENDPOINT, SANDBOX_ENDPOINT];
++const NON_STREAM_TIMEOUT_MS = 30000;
+ 
+ const REDIRECT_PATH = "/oauth-callback";
+ const AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
+@@ -328,6 +331,7 @@ const MODELS = [
+ const diagnostics = {
+   endpoint: "",
+   status: undefined,
++  attempts: [],
+   projectId: "",
+   resolvedRuntimeModel: "",
+   availableModels: "",
+@@ -410,8 +414,21 @@ export function redactSecrets(text) {
+ }
+ 
+ function safeError(error) {
+-  const raw = error instanceof Error ? error.message : String(error);
+-  return redactSecrets(raw);
++  // Keep the whole cause chain (Undici hides the real reason behind "fetch failed").
++  const parts = [];
++  const seen = new Set();
++  let current = error;
++  for (let depth = 0; current !== undefined && current !== null && depth < 5; depth += 1) {
++    const message = current instanceof Error ? current.message : String(current);
++    const code = typeof current.code === "string" ? current.code : "";
++    const text = code && !message.includes(code) ? `${message} [${code}]` : message;
++    if (text && !seen.has(text)) {
++      seen.add(text);
++      parts.push(text);
++    }
++    current = current.cause;
++  }
++  return redactSecrets(parts.join(" <- ") || "unknown error");
+ }
+ 
+ function setLastEndpoint(endpoint) {
+@@ -422,6 +439,17 @@ function setLastStatus(status) {
+   diagnostics.status = status;
+ }
+ 
++// Attempts are tracked per request: several model calls can run concurrently (the
++// session-title call next to the main turn), so a shared array would interleave them.
++// `diagnostics.attempts` only keeps a reference to the most recent one for the doctor.
++function recordLastAttempt(attempts, endpoint, status, kind) {
++  attempts.push({
++    endpoint: String(endpoint || "unknown").replace(/^https:\/\//, ""),
++    status: typeof status === "number" ? status : undefined,
++    kind: kind || undefined,
++  });
++}
++
+ function setLastProjectId(projectId) {
+   diagnostics.projectId = projectId || "";
+ }
+@@ -895,6 +923,7 @@ async function postJson(path, token, body) {
+         method: "POST",
+         headers: jsonHeaders(token),
+         body: JSON.stringify(body),
++        signal: AbortSignal.timeout(NON_STREAM_TIMEOUT_MS),
+       });
+       setLastEndpoint(endpoint);
+       setLastStatus(response.status);
+@@ -1788,6 +1817,7 @@ function mapUsage(usage) {
+ }
+ 
+ function classifyAntigravityError(message) {
++  if (/location is not supported|not supported for the API use/i.test(message)) return "LOCATION_NOT_SUPPORTED";
+   if (/\b(?:401|403)\b/.test(message)) return "AUTH";
+   if (isQuotaExceededError(message)) return QUOTA_EXCEEDED_CODE;
+   if (/\b429\b|rate.?limit/i.test(message)) return "RATE_LIMIT";
+@@ -1808,6 +1838,9 @@ function friendlyAntigravityError(status, text) {
+     if (/Invalid JSON payload|Unknown name/i.test(message)) {
+       return `Antigravity request format was rejected by the backend (${message}). Next: switch to a simpler model or update the plugin.`;
+     }
++    if (/location is not supported|not supported for the API use/i.test(message)) {
++      return `Antigravity refused this request because of your network location (${message}). Next: reach Antigravity from an exit node in a supported region, or set ANTIGRAVITY_BASE_URL to an endpoint that accepts your location.`;
++    }
+     return `Bad request from Antigravity. Backend said: ${message}`;
+   }
+   if (status === 401) return "Antigravity authentication failed. Next: run /antigravity-login, then retry.";
+@@ -1829,8 +1862,19 @@ function friendlyAntigravityError(status, text) {
+   return message || "Antigravity request failed";
+ }
+ 
++function formatAttempts(attempts) {
++  if (!Array.isArray(attempts) || !attempts.length) return "none";
++  return attempts
++    .map((entry) => `${entry.endpoint}=${entry.status ?? "ERR"}${entry.kind ? ` (${entry.kind})` : ""}`)
++    .join(" > ");
++}
++
+ function formatRequestDiagnostics(extra) {
+-  return `endpoint=${diagnostics.endpoint || "unknown"}, project=${extra.projectId}, runtimeModel=${extra.runtimeModel}, matched=${diagnostics.matchedModelDebug || "none"}, available=${diagnostics.availableModels || "unknown"}`;
++  const attempts = Array.isArray(extra.attempts) ? extra.attempts : diagnostics.attempts;
++  const lastEndpoint = attempts?.length
++    ? `https://${attempts[attempts.length - 1].endpoint}`
++    : diagnostics.endpoint || "unknown";
++  return `endpoint=${lastEndpoint}, attempts=[${formatAttempts(attempts)}], project=${extra.projectId}, runtimeModel=${extra.runtimeModel}, matched=${diagnostics.matchedModelDebug || "none"}, available=${diagnostics.availableModels || "unknown"}`;
+ }
+ 
+ function finishReasonOf(rawReason, hasToolCall, hasContent, errorMessage) {
+@@ -1937,7 +1981,7 @@ function processStreamLine(line, state) {
+       const args = isRecord(part.functionCall.args) ? part.functionCall.args : {};
+       const argsText = JSON.stringify(args);
+       const index = state.blocks.length;
+-      const block = { type: "tool-call", id: CallId(toolId), name: toolName, arguments: argsText };
++      const block = { type: "tool-call", id: ToolCallId(toolId), name: toolName, arguments: argsText };
+       state.blocks.push(block);
+       state.replayBlocks.push({
+         type: "tool-call",
+@@ -1949,7 +1993,7 @@ function processStreamLine(line, state) {
+       out.push({
+         type: "tool-call-delta",
+         index,
+-        id: CallId(toolId),
++        id: ToolCallId(toolId),
+         ...(toolName ? { name: toolName } : {}),
+         argumentsDelta: argsText,
+       });
+@@ -2615,6 +2659,7 @@ async function* requestAntigravityChunks(options, model, signal, store) {
+   let response;
+   let lastText = "";
+   let runtimeModel = runtimeCandidates[0];
++  const attempts = [];
+ 
+   for (let emptyAttempt = 0; emptyAttempt <= 2; emptyAttempt++) {
+     if (signal?.aborted) throw new LlmError("antigravity request aborted by caller", "ABORTED");
+@@ -2628,12 +2673,18 @@ async function* requestAntigravityChunks(options, model, signal, store) {
+       setLastResolvedRuntimeModel(runtimeModel);
+       const body = JSON.stringify(buildRequest(options, model, projectId, runtimeModel, effort));
+ 
++      attempts.length = 0;
++      diagnostics.attempts = attempts;
+       for (const endpoint of endpointCandidates()) {
+         setLastEndpoint(endpoint);
+         response = await fetchStreamResponse(endpoint, requestHeaders, body, signal);
+         setLastStatus(response.status);
+-        if (response.ok) break;
++        if (response.ok) {
++          recordLastAttempt(attempts, endpoint, response.status);
++          break;
++        }
+         lastText = await response.text();
++        recordLastAttempt(attempts, endpoint, response.status, classifyAntigravityError(lastText));
+         if (response.status === 429 && /Individual quota reached/i.test(lastText)) break;
+         if (![403, 404, 429, 500, 502, 503, 504].includes(response.status)) break;
+       }
+@@ -2646,7 +2697,7 @@ async function* requestAntigravityChunks(options, model, signal, store) {
+     if (!response || !response.ok) {
+       const friendly = friendlyAntigravityError(response?.status, lastText);
+       throw new LlmError(
+-        `Antigravity API error (${response?.status ?? "no response"}, ${formatRequestDiagnostics({ projectId, runtimeModel })}): ${friendly}`,
++        `Antigravity API error (${response?.status ?? "no response"}, ${formatRequestDiagnostics({ projectId, runtimeModel, attempts })}): ${friendly}`,
+         classifyAntigravityError(friendly),
+       );
+     }
+@@ -2755,6 +2806,7 @@ function doctorText() {
+     `matchedModel=${current.matchedModelDebug || "none"}`,
+     `lastEndpoint=${current.endpoint || "none"}`,
+     `lastStatus=${current.status ?? "none"}`,
++    `lastAttempts=${formatAttempts(current.attempts)}`,
+     `lastProjectId=${current.projectId || "none"}`,
+     `lastError=${current.error ? redactSecrets(current.error) : "none"}`,
+     `credentialPath=${credentialPath()}`,
